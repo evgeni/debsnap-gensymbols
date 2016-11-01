@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+
+# simple implementation of
+# "You can create a symbols file which contains the minimal version by
+#  scanning successively oldstable + stable + testing + unstable
+#  versions (or all versions from Debian snapshots) of the library as
+#  above."
+# from https://wiki.debian.org/UsingSymbolsFiles
+
+import argparse
+import tempfile
+import os
+import subprocess
+import functools
+import apt_pkg
+import requests
+
+__desc__ = "generate debian symbols file from snapshot.debian.org"
+
+_BASE_URL = "http://snapshot.debian.org/"
+
+parser = argparse.ArgumentParser(description=__desc__)
+parser.add_argument('package', help='name of the package')
+parser.add_argument('--arch', help='architecture to scan (default: %(default)s)', default="amd64")
+parser.add_argument('--skip-backports', action='store_true', help='skip packages from backports')
+
+args = parser.parse_args()
+
+apt_pkg.init()
+
+def _binvercmp(a, b):
+    return apt_pkg.version_compare(a['binary_version'], b['binary_version'])
+
+r = requests.get("%s/mr/binary/%s/" % (_BASE_URL, args.package))
+if r.status_code == requests.codes.ok:
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        versions = r.json()['result']
+        versions = sorted(versions, key=functools.cmp_to_key(_binvercmp))
+        for version in versions:
+            if args.skip_backports and '~bpo' in version['binary_version']:
+                continue
+            r2 = requests.get("%s/mr/binary/%s/%s/binfiles?fileinfo=1" % (_BASE_URL, args.package, version['binary_version']))
+            binfiles = r2.json()
+            for binfile in binfiles['result']:
+                if binfile['architecture'] == args.arch:
+                    filepath = os.path.join(tmpdirname, binfiles['fileinfo'][binfile['hash']][0]['name'])
+                    dirpath = filepath[:-4]
+                    response = requests.get("%s/file/%s" % (_BASE_URL, binfile['hash']), stream=True)
+
+                    if not response.ok:
+                        print("Could not download %s version %s for %s, skipping" % (args.package, version['binary_version'], binfile['architecture']))
+                        continue
+
+                    with open(filepath, 'wb') as handle:
+                        for block in response.iter_content(1024):
+                            handle.write(block)
+
+                    subprocess.run(["dpkg-deb", "-x", filepath, dirpath])
+                    subprocess.run(["dpkg-gensymbols", "-v%s" % version['binary_version'], "-p%s" % args.package, "-P%s" % dirpath, "-a%s" % binfile['architecture'], "-I%s.symbols" % args.package, "-O%s.symbols" % args.package])
+else:
+    print("binary package %s not found" % args.package)
